@@ -1,0 +1,27 @@
+﻿# ---- 本机运行时配置（含 DPAPI 加密后的 API Key、窗口位置）----
+# 这些文件绝对不要上传：里面有你的密钥密文和个人配置
+pnl-config.ini
+kline-config.ini
+*.local
+*.bak
+
+# ---- 构建产物 ----
+OkxPnl.exe
+src/OkxPnl.Core.cs
+obj/
+bin/
+
+# ---- 截图 / 临时 ----
+*.png
+!docs/*.png
+*.log
+
+# ---- 编辑器 / 工具 ----
+.vs/
+.vscode/
+.workbuddy/
+
+# 本地辅助脚本（不公开）
+推送更新.ps1
+发布新版本.ps1
+release-notes.md

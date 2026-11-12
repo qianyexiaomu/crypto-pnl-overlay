@@ -25,3 +25,5 @@ bin/
 推送更新.ps1
 发布新版本.ps1
 release-notes.md
+.video/
+rel-notes.md

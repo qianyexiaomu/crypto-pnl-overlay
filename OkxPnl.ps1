@@ -1,4 +1,4 @@
-param([switch]$SelfTest)
+﻿param([switch]$SelfTest)
 
 $ErrorActionPreference = 'Stop'
 
@@ -61,7 +61,11 @@ namespace OkxPnl
         public string Secret = "";
         public string Pass = "";
         public bool Demo = false;
-        public bool Ready { get { return Key.Length > 8 && Secret.Length > 8 && Pass.Length > 0; } }
+        public bool NeedPass = true;      // 币安（U 本位合约）没有 Passphrase
+        public bool Ready
+        {
+            get { return Key.Length > 8 && Secret.Length > 8 && (!NeedPass || Pass.Length > 0); }
+        }
     }
 
     public class Board : Form
@@ -82,7 +86,12 @@ namespace OkxPnl
 
         private readonly object _lk = new object();
 
-        private ApiKey _k = new ApiKey();
+        private ApiKey _k = new ApiKey();                     // OKX
+        private ApiKey _kb = new ApiKey();                    // 币安 U 本位合约（无 Passphrase）
+        private string _ex = "okx";                           // okx | binance
+        private ApiKey _ak { get { return _ex == "binance" ? _kb : _k; } }
+        private static readonly string[] EX_IDS = new string[] { "okx", "binance" };
+        private static readonly string[] EX_NAMES = new string[] { "OKX（统一账户）", "币安（U 本位合约）" };
         private string _dir;
         private string _cfgPath;
 
@@ -126,7 +135,7 @@ namespace OkxPnl
 
         private bool Configured
         {
-            get { return _k.Ready; }
+            get { return _ak.Ready; }
         }
 
         // 主窗每次取到持仓就更新这份快照，K线窗拿它画「开/强平」线（K线窗自己不做签名）
@@ -485,8 +494,9 @@ namespace OkxPnl
         private void ShowStatus()
         {
             StringBuilder s = new StringBuilder();
-            s.AppendLine("API Key: " + (_k.Ready ? "已配置" : "未配置"));
-            s.AppendLine("模拟盘: " + (_k.Demo ? "是" : "否"));
+            s.AppendLine("交易所: " + (_ex == "binance" ? "币安（U 本位合约）" : "OKX"));
+            s.AppendLine("API Key: " + (_ak.Ready ? "已配置" : "未配置"));
+            s.AppendLine("模拟盘: " + (_ak.Demo ? "是" : "否"));
             s.AppendLine("代理: " + (_proxy.Length == 0 ? "(跟随系统代理)" : _proxy));
             s.AppendLine("连接: " + (_online ? "正常" : "异常"));
             s.AppendLine("持仓数: " + _pos.Count);
@@ -510,6 +520,27 @@ namespace OkxPnl
             ToolStripMenuItem miKey = new ToolStripMenuItem("填写 / 修改 API Key");
             miKey.Click += delegate { KeyDialog(); };
             _menu.Items.Add(miKey);
+
+            ToolStripMenuItem miEx = new ToolStripMenuItem("交易所");
+            for (int i = 0; i < EX_IDS.Length; i++)
+            {
+                string eid = EX_IDS[i];
+                ToolStripMenuItem it = new ToolStripMenuItem(EX_NAMES[i]);
+                it.Checked = (_ex == eid);
+                it.Click += delegate
+                {
+                    _ex = eid;
+                    SaveCfg();
+                    _tried = false;
+                    Relayout();
+                    Invalidate();
+                    if (!_ak.Ready) KeyDialog();
+                    else FetchOnce();
+                };
+                miEx.DropDownItems.Add(it);
+            }
+            _menu.Items.Add(miEx);
+            _menu.Items.Add(new ToolStripSeparator());
 
             ToolStripMenuItem miGlass = new ToolStripMenuItem("半透明底板（方便拖拽）");
             miGlass.Checked = _glass;
@@ -815,38 +846,47 @@ namespace OkxPnl
         private void KeyDialog()
         {
             Form d = new Form();
-            d.Text = "OKX API Key";
+            d.Text = "API Key";
             d.FormBorderStyle = FormBorderStyle.FixedDialog;
             d.StartPosition = FormStartPosition.CenterScreen;
             d.MaximizeBox = false;
             d.MinimizeBox = false;
-            d.ClientSize = new Size(560, 432);
+            d.ClientSize = new Size(560, 470);
             d.TopMost = true;
             d.Font = new Font("Microsoft YaHei", 10f);
 
+            d.Controls.Add(MkLabel("交易所", 16, 14));
+            ComboBox cbEx = new ComboBox();
+            cbEx.DropDownStyle = ComboBoxStyle.DropDownList;
+            cbEx.Font = new Font("Microsoft YaHei", 10f);
+            cbEx.SetBounds(118, 10, 240, 28);
+            foreach (string n in EX_NAMES) cbEx.Items.Add(n);
+            cbEx.SelectedIndex = (_ex == "binance") ? 1 : 0;
+            d.Controls.Add(cbEx);
+
             Label tip = new Label();
-            tip.Text = "请在 OKX 后台创建【只读】权限的 API Key，切勿勾选交易和提现。";
-            tip.ForeColor = Color.FromArgb(190, 60, 60);
             tip.AutoSize = false;
-            tip.SetBounds(16, 12, 528, 26);
+            tip.ForeColor = Color.FromArgb(190, 60, 60);
+            tip.SetBounds(16, 44, 528, 26);
             d.Controls.Add(tip);
 
-            d.Controls.Add(MkLabel("API Key", 16, 52));
-            TextBox t1 = MkBox(_k.Key, 118, 48, 424);
+            d.Controls.Add(MkLabel("API Key", 16, 84));
+            TextBox t1 = MkBox("", 118, 80, 424);
             t1.UseSystemPasswordChar = false;          // 它不算秘密，明文才好核对
             d.Controls.Add(t1);
 
-            d.Controls.Add(MkLabel("Secret Key", 16, 92));
-            TextBox t2 = MkBox(_k.Secret, 118, 88, 424);
+            d.Controls.Add(MkLabel("Secret Key", 16, 124));
+            TextBox t2 = MkBox("", 118, 120, 424);
             d.Controls.Add(t2);
 
-            d.Controls.Add(MkLabel("Passphrase", 16, 132));
-            TextBox t3 = MkBox(_k.Pass, 118, 128, 424);
+            Label lbPass = MkLabel("Passphrase", 16, 164);
+            d.Controls.Add(lbPass);
+            TextBox t3 = MkBox("", 118, 160, 424);
             d.Controls.Add(t3);
 
             CheckBox cbShow = new CheckBox();
             cbShow.Text = "显示明文（核对有没有粘错）";
-            cbShow.SetBounds(118, 160, 300, 24);
+            cbShow.SetBounds(118, 194, 300, 24);
             cbShow.CheckedChanged += delegate
             {
                 t2.UseSystemPasswordChar = !cbShow.Checked;
@@ -855,29 +895,56 @@ namespace OkxPnl
             d.Controls.Add(cbShow);
 
             CheckBox cb = new CheckBox();
-            cb.Text = "模拟盘 (demo trading)";
-            cb.Checked = _k.Demo;
-            cb.SetBounds(118, 188, 220, 24);
+            cb.Text = "模拟盘 / 测试网 (demo)";
+            cb.SetBounds(118, 222, 260, 24);
             d.Controls.Add(cb);
 
             Label lbNote = new Label();
-            lbNote.Text = "OKX 建 Key 时只显示 API Key 和 Secret Key，第三项 Passphrase 是你在创建时"
-                + "自己设的那串口令，之后不会再显示 —— 只拿到两项是正常的。忘了的话，去 OKX 删掉这个 Key"
-                + "重新建一个，创建时把 Passphrase 抄下来。";
-            lbNote.ForeColor = Color.FromArgb(96, 100, 106);
             lbNote.AutoSize = false;
-            lbNote.SetBounds(16, 220, 528, 66);
+            lbNote.ForeColor = Color.FromArgb(96, 100, 106);
+            lbNote.SetBounds(16, 254, 528, 90);
             d.Controls.Add(lbNote);
+
+            bool loading = false;
+            Action refresh = delegate
+            {
+                bool bn = (cbEx.SelectedIndex == 1);
+                ApiKey src = bn ? _kb : _k;
+                loading = true;
+                t1.Text = src.Key;
+                t2.Text = src.Secret;
+                t3.Text = src.Pass;
+                t3.Enabled = !bn;
+                lbPass.Enabled = !bn;
+                cb.Checked = src.Demo;
+                loading = false;
+                if (bn)
+                {
+                    tip.Text = "币安：请创建【只读】权限的 API Key（要用平仓才勾「允许合约交易」）。";
+                    lbNote.Text = "币安没有 Passphrase，只需要 API Key 和 Secret Key 两项；注意区分"
+                        + "「现货」和「合约」——本程序走的是 U 本位合约接口（fapi），"
+                        + "Key 需要在币安「API 管理」里允许「合约」，并建议绑定 IP 白名单。";
+                }
+                else
+                {
+                    tip.Text = "OKX：请在后台创建【只读】权限的 API Key，切勿勾选交易和提现。";
+                    lbNote.Text = "OKX 建 Key 时只显示 API Key 和 Secret Key，第三项 Passphrase 是你在创建时"
+                        + "自己设的那串口令，之后不会再显示 —— 只拿到两项是正常的。忘了的话，去 OKX 删掉这个 Key"
+                        + "重新建一个，创建时把 Passphrase 抄下来。";
+                }
+            };
+            cbEx.SelectedIndexChanged += delegate { if (!loading) refresh(); };
+            refresh();
 
             Button ok = new Button();
             ok.Text = "保存";
-            ok.SetBounds(352, 384, 92, 32);
+            ok.SetBounds(352, 408, 92, 32);
             ok.DialogResult = DialogResult.OK;
             d.Controls.Add(ok);
 
             Button cancel = new Button();
             cancel.Text = "取消";
-            cancel.SetBounds(452, 384, 92, 32);
+            cancel.SetBounds(452, 408, 92, 32);
             cancel.DialogResult = DialogResult.Cancel;
             d.Controls.Add(cancel);
 
@@ -891,12 +958,17 @@ namespace OkxPnl
             {
                 if (d.ShowDialog(this) == DialogResult.OK)
                 {
-                    _k.Key = t1.Text.Trim();
-                    _k.Secret = t2.Text.Trim();
-                    _k.Pass = t3.Text.Trim();
-                    _k.Demo = cb.Checked;
+                    bool bn = (cbEx.SelectedIndex == 1);
+                    ApiKey dst = bn ? _kb : _k;
+                    dst.Key = t1.Text.Trim();
+                    dst.Secret = t2.Text.Trim();
+                    if (!bn) dst.Pass = t3.Text.Trim();
+                    dst.Demo = cb.Checked;
+                    _ex = bn ? "binance" : "okx";
                     SaveCfg();
                     _tried = false;
+                    Relayout();
+                    Invalidate();
                     FetchOnce();
                 }
             }
@@ -907,6 +979,7 @@ namespace OkxPnl
                 d.Dispose();
             }
         }
+
 
         private static Label MkLabel(string t, int x, int y)
         {
@@ -998,6 +1071,10 @@ namespace OkxPnl
                     else if (k == "secret") { _k.Secret = Dec(v); }
                     else if (k == "passphrase") { _k.Pass = Dec(v); }
                     else if (k == "demo") { _k.Demo = (v == "1"); }
+                    else if (k == "exchange") { _ex = (v == "binance") ? "binance" : "okx"; }
+                    else if (k == "bnkey") { _kb.Key = Dec(v); }
+                    else if (k == "bnsecret") { _kb.Secret = Dec(v); }
+                    else if (k == "bndemo") { _kb.Demo = (v == "1"); }
                 }
                 // 旧配置(无 uiver)沿用 0.55 浓度且无描边, 在桌面上几乎看不清, 一次性升级
                 if (uiver < 2)
@@ -1021,6 +1098,11 @@ namespace OkxPnl
                 sb.AppendLine("secret=" + Enc(_k.Secret));
                 sb.AppendLine("passphrase=" + Enc(_k.Pass));
                 sb.AppendLine("demo=" + (_k.Demo ? "1" : "0"));
+                sb.AppendLine("# 交易所: okx | binance（币安走 U 本位合约 fapi）");
+                sb.AppendLine("exchange=" + _ex);
+                sb.AppendLine("bnkey=" + Enc(_kb.Key));
+                sb.AppendLine("bnsecret=" + Enc(_kb.Secret));
+                sb.AppendLine("bndemo=" + (_kb.Demo ? "1" : "0"));
                 sb.AppendLine("x=" + _x);
                 sb.AppendLine("y=" + _y);
                 sb.AppendLine("opacity=" + _opacity.ToString("0.00", CultureInfo.InvariantCulture));
@@ -1068,7 +1150,7 @@ namespace OkxPnl
             _busy = true;
             try
             {
-                if (!_k.Ready)
+                if (!_ak.Ready)
                 {
                     _tried = true;
                     _online = false;
@@ -1083,20 +1165,27 @@ namespace OkxPnl
                 double upl = 0;
                 string err = "";
 
-                try
+                if (_ex == "binance")
                 {
-                    string bj = ApiGet("/api/v5/account/balance", _proxy, _k);
-                    eq = GetNum(bj, "totalEq");
+                    FetchBinance(list, ref eq, ref upl, ref err);
                 }
-                catch (Exception ex) { err = ex.Message; }
+                else
+                {
+                    try
+                    {
+                        string bj = ApiGet("/api/v5/account/balance", _proxy, _k);
+                        eq = GetNum(bj, "totalEq");
+                    }
+                    catch (Exception ex) { err = ex.Message; }
 
-                try
-                {
-                    string pj = ApiGet("/api/v5/account/positions", _proxy, _k);
-                    list = ParsePositions(pj);
-                    foreach (Pos p in list) upl += p.Upl;
+                    try
+                    {
+                        string pj = ApiGet("/api/v5/account/positions", _proxy, _k);
+                        list = ParsePositions(pj);
+                        foreach (Pos p in list) upl += p.Upl;
+                    }
+                    catch (Exception ex) { err = ex.Message; }
                 }
-                catch (Exception ex) { err = ex.Message; }
 
                 if (_watch) FetchWatch();
 
@@ -1325,11 +1414,190 @@ namespace OkxPnl
         }
 
 
+        // ================= 币安 U 本位合约（fapi）=================
+
+        public const string BN_BASE = "https://fapi.binance.com";
+
+        /// <summary>BTC-USDT-SWAP ↔ BTCUSDT</summary>
+        public static string ToBinSym(string inst)
+        {
+            if (inst == null) return "";
+            return inst.Replace("-SWAP", "").Replace("-", "");
+        }
+
+        public static string ToOkxInst(string sym)
+        {
+            if (sym == null) return "";
+            string s = sym.ToUpper();
+            if (s.EndsWith("USDT")) return s.Substring(0, s.Length - 4) + "-USDT-SWAP";
+            if (s.EndsWith("USDC")) return s.Substring(0, s.Length - 4) + "-USDC-SWAP";
+            return s;
+        }
+
+        /// <summary>OKX 的 1H/4H/1D → 币安的 1h/4h/1d</summary>
+        public static string BarToBin(string bar)
+        {
+            if (bar == null || bar.Length == 0) return "5m";
+            if (bar.EndsWith("H")) return bar.Substring(0, bar.Length - 1) + "h";
+            if (bar.EndsWith("D")) return bar.Substring(0, bar.Length - 1) + "d";
+            if (bar.EndsWith("W")) return bar.Substring(0, bar.Length - 1) + "w";
+            return bar;
+        }
+
+        public static string KlineUrl(string ex, string inst, string bar, int n)
+        {
+            if (ex == "binance")
+                return BN_BASE + "/fapi/v1/klines?symbol=" + ToBinSym(inst) + "&interval=" + BarToBin(bar) + "&limit=" + n;
+            return "https://www.okx.com/api/v5/market/candles?instId=" + inst + "&bar=" + bar + "&limit=" + n;
+        }
+
+        public static string TickerUrl(string ex, string inst)
+        {
+            if (ex == "binance")
+                return BN_BASE + "/fapi/v1/ticker/24hr?symbol=" + ToBinSym(inst);
+            return "https://www.okx.com/api/v5/market/ticker?instId=" + inst;
+        }
+
+        /// <summary>从 ticker 返回里取 24h 涨跌幅（%）</summary>
+        public static double Chg24Of(string ex, string body)
+        {
+            if (ex == "binance")
+            {
+                double pc = GetNum(body, "priceChangePercent");
+                return pc;
+            }
+            double lp = GetNum(body, "last");
+            double op = GetNum(body, "open24h");
+            return op > 0 ? (lp - op) / op * 100.0 : 0;
+        }
+
+        /// <summary>顶层对象数组的拆分（币安没有 "data" 外层）</summary>
+        public static List<string> SplitTopObjects(string json)
+        {
+            List<string> res = new List<string>();
+            if (json == null) return res;
+            int i = json.IndexOf('[');
+            int from = i < 0 ? 0 : i;
+            int depth = 0, start = -1;
+            for (int p = from; p < json.Length; p++)
+            {
+                char c = json[p];
+                if (c == '{') { if (depth == 0) start = p; depth++; }
+                else if (c == '}')
+                {
+                    depth--;
+                    if (depth == 0 && start >= 0) { res.Add(json.Substring(start, p - start + 1)); start = -1; }
+                }
+            }
+            return res;
+        }
+
+        /// <summary>币安签名请求：query 不用带 timestamp，这里统一补+签名</summary>
+        public static string BinanceRequest(string method, string path, string query, string proxy, ApiKey k, bool demo)
+        {
+            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
+            string baseUrl = demo ? "https://testnet.binancefuture.com" : BN_BASE;
+            long ts = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+            string q = (query == null ? "" : query.Trim().Trim('&'));
+            if (q.Length > 0) q += "&";
+            q += "timestamp=" + ts + "&recvWindow=5000";
+            string sig = Sign(k.Secret, q);
+            string url = baseUrl + path + "?" + q + "&signature=" + sig;
+
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = method;
+            req.Timeout = 12000;
+            req.ReadWriteTimeout = 12000;
+            req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+            req.Accept = "application/json";
+            req.Headers.Add("X-MBX-APIKEY", k.Key);
+            if (proxy != null && proxy.Length > 0)
+            {
+                if (proxy == "@system") req.Proxy = WebRequest.DefaultWebProxy;
+                else if (proxy == "@direct") req.Proxy = null;
+                else req.Proxy = new WebProxy(proxy);
+            }
+            try { req.Proxy.Credentials = CredentialCache.DefaultCredentials; } catch { }
+            if (method == "POST")
+            {
+                req.ContentType = "application/x-www-form-urlencoded";
+                req.ContentLength = 0;
+            }
+            try
+            {
+                using (WebResponse rp = req.GetResponse())
+                using (Stream s = rp.GetResponseStream())
+                using (StreamReader sr = new StreamReader(s, Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+            catch (WebException wex)
+            {
+                if (wex.Response != null)
+                {
+                    using (Stream es = wex.Response.GetResponseStream())
+                    using (StreamReader er = new StreamReader(es, Encoding.UTF8))
+                        return er.ReadToEnd();
+                }
+                throw;
+            }
+        }
+
+        /// <summary>币安持仓：positionRisk → Pos（InstId 统一成 OKX 风格，复用界面与看盘逻辑）</summary>
+        public static List<Pos> ParseBinancePositions(string json)
+        {
+            List<Pos> res = new List<Pos>();
+            foreach (string o in SplitTopObjects(json))
+            {
+                double amt = GetNum(o, "positionAmt");
+                if (Math.Abs(amt) < 1e-12) continue;
+                Pos p = new Pos();
+                p.InstId = ToOkxInst(GetStr(o, "symbol"));
+                string ps = GetStr(o, "positionSide");
+                p.Side = ps == "LONG" ? "long" : (ps == "SHORT" ? "short" : (amt > 0 ? "long" : "short"));
+                p.Size = Math.Abs(amt);
+                p.AvgPx = GetNum(o, "entryPrice");
+                p.MarkPx = GetNum(o, "markPrice");
+                p.Upl = GetNum(o, "unRealizedProfit");
+                p.Lever = GetNum(o, "leverage");
+                p.LiqPx = GetNum(o, "liquidationPrice");
+                p.MgnMode = "cross";
+                double notional = p.Size * p.AvgPx;
+                p.Ratio = notional > 0 ? p.Upl * Math.Max(1.0, p.Lever) / notional * 100.0 : 0;
+                res.Add(p);
+            }
+            return res;
+        }
+
+        /// <summary>拉币安的权益/持仓（U 本位合约）</summary>
+        private void FetchBinance(List<Pos> list, ref double eq, ref double upl, ref string err)
+        {
+            try
+            {
+                string bj = BinanceRequest("GET", "/fapi/v2/account", "", _proxy, _kb, _kb.Demo);
+                eq = GetNum(bj, "totalMarginBalance");
+                if (eq <= 0) eq = GetNum(bj, "totalWalletBalance") + GetNum(bj, "totalUnrealizedProfit");
+                if (bj.IndexOf("code") >= 0 && bj.IndexOf("totalWalletBalance") < 0)
+                    err = "币安: " + GetStr(bj, "msg");
+            }
+            catch (Exception ex) { err = "币安余额: " + ex.Message; }
+
+            try
+            {
+                string pj = BinanceRequest("GET", "/fapi/v2/positionRisk", "", _proxy, _kb, _kb.Demo);
+                List<Pos> ps = ParseBinancePositions(pj);
+                list.AddRange(ps);
+                foreach (Pos p in ps) upl += p.Upl;
+                if (pj.IndexOf("code") >= 0 && pj.IndexOf("symbol") < 0)
+                    err = "币安持仓: " + GetStr(pj, "msg");
+            }
+            catch (Exception ex) { err = "币安持仓: " + ex.Message; }
+        }
+
         /// <summary>平掉一笔持仓：二次确认 → 本机签名调用 close-position</summary>
         private void ClosePosition(Pos p)
         {
             if (p == null) return;
-            if (!_k.Ready)
+            if (!_ak.Ready)
             {
                 MessageBox.Show("还没配置 API Key。", "平仓", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -1345,6 +1613,12 @@ namespace OkxPnl
                 + "点「是」会立刻以市价平仓，不可撤回。";
             if (MessageBox.Show(q, "一键平仓", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
                 return;
+
+            if (_ex == "binance")
+            {
+                CloseBinance(p);
+                return;
+            }
 
             string dq = ((char)34).ToString();
             string body = "{" + dq + "instId" + dq + ":" + dq + p.InstId + dq
@@ -1383,12 +1657,52 @@ namespace OkxPnl
             FetchOnce();
         }
 
+        /// <summary>币安平仓：市价单 + reduceOnly（单向持仓）；对冲模式自动改 positionSide</summary>
+        private void CloseBinance(Pos p)
+        {
+            string nl = Environment.NewLine;
+            string sym = ToBinSym(p.InstId);
+            string side = (p.Side == "short") ? "BUY" : "SELL";
+            string qty = p.Size.ToString("0.########", CultureInfo.InvariantCulture);
+            string baseQ = "symbol=" + sym + "&side=" + side + "&type=MARKET&quantity=" + qty + "&newOrderRespType=RESULT";
+
+            string resp = "";
+            try
+            {
+                resp = BinanceRequest("POST", "/fapi/v1/order", baseQ + "&reduceOnly=true", _proxy, _kb, _kb.Demo);
+                if (resp.IndexOf("reduceOnly") >= 0 && resp.IndexOf("orderId") < 0)
+                {
+                    // 对冲模式不支持 reduceOnly，改用 positionSide
+                    string ps = (p.Side == "short") ? "SHORT" : "LONG";
+                    resp = BinanceRequest("POST", "/fapi/v1/order", baseQ + "&positionSide=" + ps, _proxy, _kb, _kb.Demo);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("平仓请求失败：" + nl + ex.Message, "一键平仓", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (resp.IndexOf("orderId") >= 0)
+            {
+                MessageBox.Show("已下单平仓：" + p.InstId + " " + qty, "一键平仓",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show("平仓被拒绝：" + GetStr(resp, "msg") + nl + nl
+                    + "常见原因：Key 没开「合约交易」权限 / IP 不在白名单 / 系统时间偏差。", "一键平仓",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            FetchOnce();
+        }
+
         private void ToggleChart()
         {
             try
             {
                 if (_chart == null || _chart.IsDisposed)
-                    _chart = new KForm(_dir, _proxy, _invert);
+                    _chart = new KForm(_dir, _proxy, _invert, _ex);
                 if (_chart.Visible) { _chart.Hide(); }
                 else { _chart.Show(); _chart.TopMost = true; _chart.Activate(); }
             }
@@ -1537,8 +1851,7 @@ namespace OkxPnl
             {
                 // 小 K 线：周期可单独指定（留空=跟随看盘周期），根数可调；走 OKX 公有行情，不需要签名
                 string kbar = _watchKBar.Length > 0 ? _watchKBar : _bar;
-                string body = HttpGet("https://www.okx.com/api/v5/market/candles?instId=" + inst
-                    + "&bar=" + kbar + "&limit=" + _watchKn, _proxy);
+                string body = HttpGet(KlineUrl(_ex, inst, kbar, _watchKn), _proxy);
 
                 string code = GetStr(body, "code");
                 if (code.Length > 0 && code != "0")
@@ -1554,10 +1867,9 @@ namespace OkxPnl
                         double chg = cs[0].O > 0 ? (cs[cs.Count - 1].C - cs[0].O) / cs[0].O * 100.0 : 0;
                         try
                         {
-                            string tk = HttpGet("https://www.okx.com/api/v5/market/ticker?instId=" + inst, _proxy);
-                            double op = GetNum(tk, "open24h");
-                            double lp = GetNum(tk, "last");
-                            if (op > 0 && lp > 0) chg = (lp - op) / op * 100.0;
+                            string tk = HttpGet(TickerUrl(_ex, inst), _proxy);
+                            double c24 = Chg24Of(_ex, tk);
+                            if (c24 != 0) chg = c24;
                         }
                         catch { }
 
@@ -2275,6 +2587,7 @@ namespace OkxPnl
         private readonly string _dir;
         private readonly string _cfgPath;
         private readonly string _proxy;
+        private readonly string _ex;
 
         private List<string> _syms = new List<string>();
         private readonly Dictionary<string, List<Candle>> _bars = new Dictionary<string, List<Candle>>();
@@ -2314,15 +2627,16 @@ namespace OkxPnl
 
 
         public KForm(string dir)
-            : this(dir, "", false)
+            : this(dir, "", false, "okx")
         {
         }
 
-        public KForm(string dir, string proxy, bool invert)
+        public KForm(string dir, string proxy, bool invert, string ex)
         {
             _dir = dir;
             _cfgPath = Path.Combine(dir, "kline-config.ini");
             _proxy = (proxy == null ? "" : proxy);
+            _ex = (ex == "binance") ? "binance" : "okx";
             if (invert)
             {
                 Color t = KCU;
@@ -2570,9 +2884,8 @@ namespace OkxPnl
         }
         private string Fetch(string inst)
         {
-            // OKX 公有行情，不需要 API Key
-            return Board.HttpGet("https://www.okx.com/api/v5/market/candles?instId=" + inst
-                + "&bar=" + _bar + "&limit=" + _n, _proxy);
+            // 公有行情，不需要 API Key（OKX / 币安各走各的接口）
+            return Board.HttpGet(Board.KlineUrl(_ex, inst, _bar, _n), _proxy);
         }
 
         private static string KStr(string json, string key)

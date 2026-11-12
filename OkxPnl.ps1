@@ -45,6 +45,8 @@ namespace OkxPnl
         public double Lever;
         public double LiqPx;
         public string MgnMode = "cross";
+        public bool IsSpot;          // 现货资产（没有盈亏，只有市值）
+        public double Notional;      // 现货市值（USDT）
     }
 
     public class Candle
@@ -89,6 +91,7 @@ namespace OkxPnl
         private ApiKey _k = new ApiKey();                     // OKX
         private ApiKey _kb = new ApiKey();                    // 币安 U 本位合约（无 Passphrase）
         private string _ex = "okx";                           // okx | binance
+        private string _mkt = "swap";                         // swap（合约）| spot（现货）
         private ApiKey _ak { get { return _ex == "binance" ? _kb : _k; } }
         private static readonly string[] EX_IDS = new string[] { "okx", "binance" };
         private static readonly string[] EX_NAMES = new string[] { "OKX（统一账户）", "币安（U 本位合约）" };
@@ -520,6 +523,28 @@ namespace OkxPnl
             ToolStripMenuItem miKey = new ToolStripMenuItem("填写 / 修改 API Key");
             miKey.Click += delegate { KeyDialog(); };
             _menu.Items.Add(miKey);
+
+            ToolStripMenuItem miMkt = new ToolStripMenuItem("市场");
+            string[] mkts = new string[] { "合约（永续）", "现货" };
+            string[] mktIds = new string[] { "swap", "spot" };
+            for (int i = 0; i < mktIds.Length; i++)
+            {
+                string mid = mktIds[i];
+                ToolStripMenuItem it = new ToolStripMenuItem(mkts[i]);
+                it.Checked = (_mkt == mid);
+                it.Click += delegate
+                {
+                    _mkt = mid;
+                    SaveCfg();
+                    _tried = false;
+                    InvalidateWatch();
+                    Relayout();
+                    Invalidate();
+                    FetchOnce();
+                };
+                miMkt.DropDownItems.Add(it);
+            }
+            _menu.Items.Add(miMkt);
 
             ToolStripMenuItem miEx = new ToolStripMenuItem("交易所");
             for (int i = 0; i < EX_IDS.Length; i++)
@@ -1072,6 +1097,7 @@ namespace OkxPnl
                     else if (k == "passphrase") { _k.Pass = Dec(v); }
                     else if (k == "demo") { _k.Demo = (v == "1"); }
                     else if (k == "exchange") { _ex = (v == "binance") ? "binance" : "okx"; }
+                    else if (k == "market") { _mkt = (v == "spot") ? "spot" : "swap"; }
                     else if (k == "bnkey") { _kb.Key = Dec(v); }
                     else if (k == "bnsecret") { _kb.Secret = Dec(v); }
                     else if (k == "bndemo") { _kb.Demo = (v == "1"); }
@@ -1100,6 +1126,8 @@ namespace OkxPnl
                 sb.AppendLine("demo=" + (_k.Demo ? "1" : "0"));
                 sb.AppendLine("# 交易所: okx | binance（币安走 U 本位合约 fapi）");
                 sb.AppendLine("exchange=" + _ex);
+                sb.AppendLine("# market: swap（合约）| spot（现货）");
+                sb.AppendLine("market=" + _mkt);
                 sb.AppendLine("bnkey=" + Enc(_kb.Key));
                 sb.AppendLine("bnsecret=" + Enc(_kb.Secret));
                 sb.AppendLine("bndemo=" + (_kb.Demo ? "1" : "0"));
@@ -1165,7 +1193,11 @@ namespace OkxPnl
                 double upl = 0;
                 string err = "";
 
-                if (_ex == "binance")
+                if (_mkt == "spot")
+                {
+                    FetchSpot(list, ref eq, ref upl, ref err);
+                }
+                else if (_ex == "binance")
                 {
                     FetchBinance(list, ref eq, ref upl, ref err);
                 }
@@ -1542,6 +1574,115 @@ namespace OkxPnl
             }
         }
 
+        // ================= 现货（OKX / 币安）=================
+
+        /// <summary>现货符号：BTC-USDT-SWAP → BTC-USDT（OKX 现货）</summary>
+        public static string ToSpotInst(string inst)
+        {
+            if (inst == null) return "";
+            return inst.Replace("-SWAP", "");
+        }
+
+        /// <summary>合约符号 ↔ 现货符号</summary>
+        public string MktInst(string inst)
+        {
+            if (_mkt != "spot") return inst;
+            return ToSpotInst(inst);
+        }
+
+        /// <summary>拉现货持仓：资产余额 > 0 的币，按最新价折算 USDT</summary>
+        public void FetchSpot(List<Pos> list, ref double eq, ref double upl, ref string err)
+        {
+            try
+            {
+                if (_ex == "binance")
+                {
+                    string bj = BinanceRequest("GET", "/api/v3/account", "", _proxy, _kb, _kb.Demo);
+                    double total = 0;
+                    foreach (string o in SplitTopObjects(bj))
+                    {
+                        string asset = GetStr(o, "asset");
+                        if (asset.Length == 0 || asset == "USDT") continue;
+                        double free = GetNum(o, "free");
+                        double locked = GetNum(o, "locked");
+                        double qty = free + locked;
+                        if (qty <= 0) continue;
+                        string sym = asset + "USDT";
+                        double px = 0, chg = 0;
+                        try
+                        {
+                            string tk = HttpGet("https://api.binance.com/api/v3/ticker/24hr?symbol=" + sym, _proxy);
+                            px = GetNum(tk, "lastPrice");
+                            chg = GetNum(tk, "priceChangePercent");
+                        }
+                        catch { }
+                        if (px <= 0) continue;
+                        Pos p = new Pos();
+                        p.InstId = asset + "-USDT";
+                        p.Name = asset;
+                        p.Side = "spot";
+                        p.IsSpot = true;
+                        p.Size = qty;
+                        p.AvgPx = px;
+                        p.MarkPx = px;
+                        p.Notional = qty * px;
+                        p.Ratio = chg;
+                        total += p.Notional;
+                        list.Add(p);
+                    }
+                    // USDT 现金也算进权益
+                    double cash = 0;
+                    foreach (string o in SplitTopObjects(bj))
+                    {
+                        if (GetStr(o, "asset") == "USDT") cash = GetNum(o, "free") + GetNum(o, "locked");
+                    }
+                    eq = total + cash;
+                }
+                else
+                {
+                    string aj = ApiGet("/api/v5/asset/balances", _proxy, _k);
+                    double total = 0;
+                    foreach (string o in SplitTopObjects(aj))
+                    {
+                        string ccy = GetStr(o, "ccy");
+                        if (ccy.Length == 0 || ccy == "USDT") continue;
+                        double qty = GetNum(o, "bal") + GetNum(o, "frozenBal");
+                        if (qty <= 0) continue;
+                        string inst = ccy + "-USDT";
+                        double px = 0, chg = 0;
+                        try
+                        {
+                            string tk = HttpGet("https://www.okx.com/api/v5/market/ticker?instId=" + inst, _proxy);
+                            px = GetNum(tk, "last");
+                            double op = GetNum(tk, "open24h");
+                            if (op > 0) chg = (px - op) / op * 100.0;
+                        }
+                        catch { }
+                        if (px <= 0) continue;
+                        Pos p = new Pos();
+                        p.InstId = inst;
+                        p.Name = ccy;
+                        p.Side = "spot";
+                        p.IsSpot = true;
+                        p.Size = qty;
+                        p.AvgPx = px;
+                        p.MarkPx = px;
+                        p.Notional = qty * px;
+                        p.Ratio = chg;
+                        total += p.Notional;
+                        list.Add(p);
+                    }
+                    double cash = 0;
+                    foreach (string o in SplitTopObjects(aj))
+                    {
+                        if (GetStr(o, "ccy") == "USDT") cash = GetNum(o, "bal") + GetNum(o, "frozenBal");
+                    }
+                    eq = total + cash;
+                }
+            }
+            catch (Exception ex) { err = "现货: " + ex.Message; }
+        }
+
         /// <summary>币安持仓：positionRisk → Pos（InstId 统一成 OKX 风格，复用界面与看盘逻辑）</summary>
         public static List<Pos> ParseBinancePositions(string json)
         {
@@ -1614,6 +1755,12 @@ namespace OkxPnl
             if (MessageBox.Show(q, "一键平仓", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
                 return;
 
+            if (p.IsSpot)
+            {
+                CloseSpot(p);
+                return;
+            }
+
             if (_ex == "binance")
             {
                 CloseBinance(p);
@@ -1654,6 +1801,53 @@ namespace OkxPnl
                 MessageBox.Show("平仓被拒绝：" + code + " " + GetStr(resp, "msg"), "一键平仓",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+            FetchOnce();
+        }
+
+        /// <summary>现货「平仓」= 市价全部卖出该币种</summary>
+        private void CloseSpot(Pos p)
+        {
+            string nl = Environment.NewLine;
+            string qty = p.Size.ToString("0.########", CultureInfo.InvariantCulture);
+            if (MessageBox.Show("现货没有平仓，确认要市价卖出手里全部 " + p.Name + " 吗？" + nl + nl
+                + p.Name + "  数量 " + qty + nl
+                + "约合 " + p.Notional.ToString("#,0.00", CultureInfo.InvariantCulture) + " USDT",
+                "卖出", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
+
+            string resp = "";
+            try
+            {
+                if (_ex == "binance")
+                {
+                    string sym = p.Name + "USDT";
+                    resp = BinanceRequest("POST", "/api/v3/order",
+                        "symbol=" + sym + "&side=SELL&type=MARKET&quantity=" + qty, _proxy, _kb, _kb.Demo);
+                }
+                else
+                {
+                    string inst = p.Name + "-USDT";
+                    string dq = ((char)34).ToString();
+                    string body = "{" + dq + "instId" + dq + ":" + dq + inst + dq
+                        + "," + dq + "tdMode" + dq + ":" + dq + "cash" + dq
+                        + "," + dq + "side" + dq + ":" + dq + "sell" + dq
+                        + "," + dq + "ordType" + dq + ":" + dq + "market" + dq
+                        + "," + dq + "sz" + dq + ":" + dq + qty + dq
+                        + "," + dq + "tgtCcy" + dq + ":" + dq + "base_ccy" + dq + "}";
+                    resp = ApiPost("/api/v5/trade/order", body, _proxy, _k);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("下单失败：" + nl + ex.Message, "卖出", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            string code = GetStr(resp, "code");
+            if (resp.IndexOf("orderId") >= 0 && (code.Length == 0 || code == "0"))
+                MessageBox.Show("已提交卖出：" + p.Name + " " + qty, "卖出", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            else
+                MessageBox.Show("卖出被拒绝：" + code + " " + GetStr(resp, "msg"), "卖出", MessageBoxButtons.OK, MessageBoxIcon.Error);
             FetchOnce();
         }
 
@@ -1851,7 +2045,7 @@ namespace OkxPnl
             {
                 // 小 K 线：周期可单独指定（留空=跟随看盘周期），根数可调；走 OKX 公有行情，不需要签名
                 string kbar = _watchKBar.Length > 0 ? _watchKBar : _bar;
-                string body = HttpGet(KlineUrl(_ex, inst, kbar, _watchKn), _proxy);
+                string body = HttpGet(KlineUrl(_ex, MktInst(inst), kbar, _watchKn), _proxy);
 
                 string code = GetStr(body, "code");
                 if (code.Length > 0 && code != "0")
@@ -1867,7 +2061,7 @@ namespace OkxPnl
                         double chg = cs[0].O > 0 ? (cs[cs.Count - 1].C - cs[0].O) / cs[0].O * 100.0 : 0;
                         try
                         {
-                            string tk = HttpGet(TickerUrl(_ex, inst), _proxy);
+                            string tk = HttpGet(TickerUrl(_ex, MktInst(inst)), _proxy);
                             double c24 = Chg24Of(_ex, tk);
                             if (c24 != 0) chg = c24;
                         }
@@ -2108,6 +2302,7 @@ namespace OkxPnl
         private string CompactRight()
         {
             if (_pos.Count == 0 && _totalEq > 0) return "空仓";
+            if (_mkt == "spot") return "";
             return Money(_upl, true);
         }
 
@@ -2160,11 +2355,11 @@ namespace OkxPnl
                         if (need > nameW) nameW = need;
                     }
                     float colA = g.MeasureString(Pct(_upl), _fNum).Width;
-                    float colB = g.MeasureString(Money(_upl, true), _fNum).Width;
+                    float colB = g.MeasureString(_mkt == "spot" ? "9,999,999" : Money(_upl, true), _fNum).Width;
                     foreach (Pos p in _pos)
                     {
                         float a = g.MeasureString(Pct(p.Ratio), _fNum).Width;
-                        float b = g.MeasureString(Money(p.Upl, true), _fNum).Width;
+                        float b = g.MeasureString(p.IsSpot ? p.Notional.ToString("#,0.##", CultureInfo.InvariantCulture) : Money(p.Upl, true), _fNum).Width;
                         if (a > colA) colA = a;
                         if (b > colB) colB = b;
                     }
@@ -2497,7 +2692,7 @@ namespace OkxPnl
                 using (SolidBrush b = new SolidBrush(ColorOf(p.Upl)))
                     TxtIn(g, Pct(p.Ratio), _fNum, b, new RectangleF(pctX, y, ColPct, rowH), StringAlignment.Far);
                 using (SolidBrush b = new SolidBrush(ColorOf(p.Upl)))
-                    TxtIn(g, Money(p.Upl, true), _fNum, b, new RectangleF(moneyX, y, ColMoney, rowH), StringAlignment.Far);
+                    TxtIn(g, p.IsSpot ? p.Notional.ToString("#,0.##", CultureInfo.InvariantCulture) : Money(p.Upl, true), _fNum, b, new RectangleF(moneyX, y, ColMoney, rowH), StringAlignment.Far);
 
                 y += rowH;
                 n++;
